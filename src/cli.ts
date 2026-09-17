@@ -3,6 +3,8 @@
 import { parseHTML } from 'linkedom';
 import { clip, matchTemplate, DocumentParser } from './api';
 import { openInObsidian } from './utils/cli-utils';
+import { fetchViaBrowser } from './utils/browser-fetch';
+import { sanitizeFileName } from './utils/string-utils';
 import { Template } from './types/types';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -13,7 +15,7 @@ import * as path from 'path';
 
 interface CliArgs {
 	url: string;
-	templatePath: string;
+	templatePath?: string;
 	outputPath?: string;
 	vault?: string;
 	open: boolean;
@@ -21,17 +23,45 @@ interface CliArgs {
 	uri: boolean;
 	propertyTypesPath?: string;
 	htmlPath?: string;
+	browser: boolean;
+	interactive: boolean;
+	browserPath?: string;
 }
+
+// Default template used when --template is omitted (AI-agent mode).
+const DEFAULT_TEMPLATE: Template = {
+	id: 'cli-default',
+	name: 'Default',
+	behavior: 'create',
+	noteNameFormat: '{{title}}',
+	path: '',
+	noteContentFormat: '{{content}}',
+	properties: [
+		{ name: 'title', value: '{{title}}' },
+		{ name: 'source', value: '{{url}}' },
+		{ name: 'author', value: '{{author}}' },
+		{ name: 'published', value: '{{published}}' },
+		{ name: 'created', value: '{{date}}' },
+	],
+};
 
 function printUsage(): void {
 	const usage = `
 Usage: obsidian-clipper <url> [options]
 
 Options:
-  -t, --template <path>        Path to template JSON file or directory (required)
+  -t, --template <path>        Path to template JSON file or directory
                                If a directory, auto-matches template by URL triggers
-  -o, --output <path>          Output .md file path (default: stdout)
+                               (optional: a built-in default template is used when omitted)
+  -o, --output <path>          Output path. If it's a directory, the file is named
+                               after the page title and the full path is printed to stdout.
+                               Default: stdout
       --html <path>            Read HTML from file instead of fetching URL (use - for stdin)
+      --browser                Fetch the page via a real browser (persistent profile,
+                               keeps login cookies; renders JS-heavy pages)
+      --interactive            Like --browser, but the browser stays open until you
+                               close it — use to log in to a site the first time
+      --browser-path <path>    Custom browser executable (default: Chrome, then Edge)
       --vault <name>           Obsidian vault name
       --open                   Send to Obsidian instead of writing file
       --uri                    Use URI scheme instead of Obsidian CLI
@@ -45,7 +75,7 @@ Options:
 function parseArgs(argv: string[]): CliArgs {
 	const args = argv.slice(2);
 	let url = '';
-	let templatePath = '';
+	let templatePath: string | undefined;
 	let outputPath: string | undefined;
 	let vault: string | undefined;
 	let open = false;
@@ -53,6 +83,9 @@ function parseArgs(argv: string[]): CliArgs {
 	let uri = false;
 	let propertyTypesPath: string | undefined;
 	let htmlPath: string | undefined;
+	let browser = false;
+	let interactive = false;
+	let browserPath: string | undefined;
 
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i];
@@ -89,6 +122,17 @@ function parseArgs(argv: string[]): CliArgs {
 				if (i + 1 >= args.length) { console.error('Error: --html requires a value'); process.exit(1); }
 				htmlPath = args[++i];
 				break;
+			case '--browser':
+				browser = true;
+				break;
+			case '--interactive':
+				interactive = true;
+				browser = true;
+				break;
+			case '--browser-path':
+				if (i + 1 >= args.length) { console.error('Error: --browser-path requires a value'); process.exit(1); }
+				browserPath = args[++i];
+				break;
 			case '--property-types':
 				if (i + 1 >= args.length) { console.error('Error: --property-types requires a value'); process.exit(1); }
 				propertyTypesPath = args[++i];
@@ -110,13 +154,7 @@ function parseArgs(argv: string[]): CliArgs {
 		process.exit(1);
 	}
 
-	if (!templatePath) {
-		console.error('Error: --template is required');
-		printUsage();
-		process.exit(1);
-	}
-
-	return { url, templatePath, outputPath, vault, open, silent, uri, propertyTypesPath, htmlPath };
+	return { url, templatePath, outputPath, vault, open, silent, uri, propertyTypesPath, htmlPath, browser, interactive, browserPath };
 }
 
 // ---------------------------------------------------------------------------
@@ -147,27 +185,59 @@ const linkedomParser: DocumentParser = {
 };
 
 // ---------------------------------------------------------------------------
+// Output path resolution (supports writing into a directory)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve -o: an existing directory (or a trailing-separator / extensionless
+ * path) means "write into it, named after the note"; anything else is a file.
+ * Returns the absolute file path.
+ */
+function resolveOutputPath(outputPath: string, noteName: string, url: string): string {
+	const resolved = path.resolve(outputPath);
+	let isDir: boolean;
+	if (fs.existsSync(resolved)) {
+		isDir = fs.statSync(resolved).isDirectory();
+	} else {
+		isDir = !path.extname(resolved) || resolved.endsWith(path.sep) || resolved.endsWith('/');
+	}
+
+	if (!isDir) return resolved;
+
+	fs.mkdirSync(resolved, { recursive: true });
+	// clip() already sanitizes noteName; fall back to the host when untitled.
+	const name = noteName && noteName !== 'Untitled'
+		? noteName
+		: sanitizeFileName(new URL(url).hostname);
+	return path.join(resolved, `${name}.md`);
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
 	const args = parseArgs(process.argv);
 
-	// Determine if template path is a file or directory
-	const resolvedTemplatePath = path.resolve(args.templatePath);
-	const isDir = fs.statSync(resolvedTemplatePath).isDirectory();
+	// Determine if template path is a file or directory (omitted -> built-in default)
 	let templates: Template[] | undefined;
 	let template: Template | undefined;
 
-	if (isDir) {
-		templates = loadTemplatesFromDir(resolvedTemplatePath);
-		if (templates.length === 0) {
-			console.error(`Error: No .json template files found in ${args.templatePath}`);
-			process.exit(1);
+	if (args.templatePath) {
+		const resolvedTemplatePath = path.resolve(args.templatePath);
+		const isDir = fs.statSync(resolvedTemplatePath).isDirectory();
+		if (isDir) {
+			templates = loadTemplatesFromDir(resolvedTemplatePath);
+			if (templates.length === 0) {
+				console.error(`Error: No .json template files found in ${args.templatePath}`);
+				process.exit(1);
+			}
+		} else {
+			const templateRaw = fs.readFileSync(resolvedTemplatePath, 'utf-8');
+			template = JSON.parse(templateRaw);
 		}
 	} else {
-		const templateRaw = fs.readFileSync(resolvedTemplatePath, 'utf-8');
-		template = JSON.parse(templateRaw);
+		template = DEFAULT_TEMPLATE;
 	}
 
 	// Load optional property types
@@ -177,13 +247,22 @@ async function main(): Promise<void> {
 		propertyTypes = JSON.parse(raw);
 	}
 
-	// Get HTML: from file/stdin (--html) or by fetching URL
+	// Get HTML: from file/stdin (--html), via real browser (--browser), or by fetching URL
 	let html: string;
 	if (args.htmlPath) {
 		if (args.htmlPath === '-') {
 			html = fs.readFileSync(0, 'utf-8'); // stdin
 		} else {
 			html = fs.readFileSync(path.resolve(args.htmlPath), 'utf-8');
+		}
+	} else if (args.browser) {
+		html = await fetchViaBrowser(args.url, {
+			interactive: args.interactive,
+			browserPath: args.browserPath,
+		});
+		// ponytail: debug-only env dump for diagnosing bad captures
+		if (process.env.CLIPPER_DEBUG_HTML) {
+			fs.writeFileSync(process.env.CLIPPER_DEBUG_HTML, html, 'utf-8');
 		}
 	} else {
 		const response = await fetch(args.url);
@@ -251,8 +330,10 @@ async function main(): Promise<void> {
 		);
 		console.error(obsResult);
 	} else if (args.outputPath) {
-		fs.writeFileSync(path.resolve(args.outputPath), result.fullContent, 'utf-8');
-		console.error(`Written to ${args.outputPath}`);
+		const filePath = resolveOutputPath(args.outputPath, result.noteName, args.url);
+		fs.writeFileSync(filePath, result.fullContent, 'utf-8');
+		// Full path on stdout so calling agents can pick it up.
+		console.log(filePath);
 	} else {
 		process.stdout.write(result.fullContent);
 	}
