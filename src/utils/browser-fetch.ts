@@ -3,14 +3,14 @@
 // cookies survive between runs — log in once with --interactive, then plain
 // --browser reuses the session.
 
-import { spawn } from 'child_process';
+import { spawn, type ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import WebSocket from 'ws';
 
 export interface BrowserFetchOptions {
-	/** Wait for Enter in the terminal before capturing (first-time login flow). */
+	/** Wait for the user to close the browser window after logging in. */
 	interactive?: boolean;
 	/** Custom browser executable path. */
 	browserPath?: string;
@@ -45,11 +45,13 @@ async function waitForStableContent(page: CdpConnection, maxMs = 10000): Promise
 	let prev = -1;
 	const deadline = Date.now() + maxMs;
 	while (Date.now() < deadline) {
-		await sleep(400);
+		await sleep(Math.min(400, deadline - Date.now()));
+		const remaining = deadline - Date.now();
+		if (remaining <= 0) return;
 		const res = await page.send('Runtime.evaluate', {
 			expression: 'document.body ? document.body.innerText.length : 0',
 			returnByValue: true,
-		});
+		}, remaining);
 		const len = res?.result?.value ?? 0;
 		if (len === prev && len > 0) return;
 		prev = len;
@@ -61,10 +63,13 @@ class CdpConnection {
 	private ws: WebSocket;
 	private nextId = 1;
 	private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>();
-	private eventWaiters: { method: string; resolve: () => void }[] = [];
+	private eventWaiters = new Set<{ method: string; resolve: () => void; reject: (e: Error) => void }>();
+	private closedError?: Error;
 
 	constructor(ws: WebSocket) {
 		this.ws = ws;
+		ws.on('close', () => this.fail(new Error('CDP connection closed')));
+		ws.on('error', (error: Error) => this.fail(error));
 		ws.on('message', (data: WebSocket.RawData) => {
 			const msg = JSON.parse(data.toString());
 			if (msg.id && this.pending.has(msg.id)) {
@@ -73,64 +78,124 @@ class CdpConnection {
 				if (msg.error) p.reject(new Error(msg.error.message));
 				else p.resolve(msg.result);
 			} else if (msg.method) {
-				this.eventWaiters = this.eventWaiters.filter(w => {
-					if (w.method === msg.method) { w.resolve(); return false; }
-					return true;
-				});
+				for (const waiter of this.eventWaiters) {
+					if (waiter.method === msg.method) waiter.resolve();
+				}
 			}
 		});
 	}
 
 	static async connect(url: string): Promise<CdpConnection> {
 		const ws = new WebSocket(url, { perMessageDeflate: false, maxPayload: 256 * 1024 * 1024 });
-		await new Promise<void>((resolve, reject) => {
-			ws.once('open', resolve);
-			ws.once('error', reject);
-		});
-		return new CdpConnection(ws);
+		const connection = new CdpConnection(ws);
+		try {
+			await new Promise<void>((resolve, reject) => {
+				const cleanup = () => {
+					clearTimeout(timer);
+					ws.off('open', onOpen);
+					ws.off('error', onError);
+					ws.off('close', onClose);
+				};
+				const onOpen = () => { cleanup(); resolve(); };
+				const onError = (error: Error) => { cleanup(); reject(error); };
+				const onClose = () => onError(new Error('CDP connection closed before opening'));
+				const timer = setTimeout(() => onError(new Error('CDP connection timed out')), 10000);
+				ws.once('open', onOpen);
+				ws.once('error', onError);
+				ws.once('close', onClose);
+			});
+			return connection;
+		} catch (error) {
+			ws.terminate();
+			throw error;
+		}
 	}
 
-	send(method: string, params: Record<string, unknown> = {}): Promise<any> {
+	send(method: string, params: Record<string, unknown> = {}, timeoutMs = 10000): Promise<any> {
+		if (this.closedError) return Promise.reject(this.closedError);
 		const id = this.nextId++;
 		return new Promise((resolve, reject) => {
-			this.pending.set(id, { resolve, reject });
-			this.ws.send(JSON.stringify({ id, method, params }));
+			const cleanup = () => { clearTimeout(timer); this.pending.delete(id); };
+			const fail = (error: Error) => { cleanup(); reject(error); };
+			const timer = setTimeout(() => fail(new Error(`CDP command ${method} timed out`)), timeoutMs);
+			this.pending.set(id, {
+				resolve: value => { cleanup(); resolve(value); },
+				reject: fail,
+			});
+			try {
+				this.ws.send(JSON.stringify({ id, method, params }), error => {
+					if (error) fail(error);
+				});
+			} catch (error) {
+				fail(error as Error);
+			}
 		});
 	}
 
-	/** Resolve the next time the given event fires (loadEventFired etc.). */
-	waitForEvent(method: string): Promise<void> {
-		return new Promise(resolve => this.eventWaiters.push({ method, resolve }));
+	/** Wait for an event, or continue after the navigation wait limit. */
+	waitForEvent(method: string, timeoutMs: number): Promise<void> {
+		if (this.closedError) return Promise.reject(this.closedError);
+		return new Promise((resolve, reject) => {
+			const cleanup = () => { clearTimeout(timer); this.eventWaiters.delete(waiter); };
+			const waiter = {
+				method,
+				resolve: () => { cleanup(); resolve(); },
+				reject: (error: Error) => { cleanup(); reject(error); },
+			};
+			const timer = setTimeout(waiter.resolve, timeoutMs);
+			this.eventWaiters.add(waiter);
+		});
+	}
+
+	private fail(error: Error): void {
+		this.closedError = error;
+		for (const request of this.pending.values()) request.reject(error);
+		for (const waiter of this.eventWaiters) waiter.reject(error);
 	}
 
 	close(): void {
+		this.fail(new Error('CDP connection closed'));
 		this.ws.close();
 	}
 }
 
+async function fetchDevToolsJson(port: string, endpoint: string, method = 'GET'): Promise<any> {
+	const response = await fetch(`http://127.0.0.1:${port}${endpoint}`, {
+		method,
+		signal: AbortSignal.timeout(5000),
+	});
+	return response.json();
+}
+
+function hasExited(child: ChildProcess): boolean {
+	return child.exitCode !== null || child.signalCode !== null;
+}
+
 /**
- * Wait until all page targets are gone (user closed the window).
- * Portable: on macOS closing the window does NOT exit the Chrome process,
- * so waiting for process exit would hang forever.
+ * Wait for all page targets to disappear. On macOS this leaves the process
+ * alive, so return false to reuse it; return true when a restart is needed.
  */
-async function waitForBrowserClosed(port: string, child: { exitCode: number | null }): Promise<void> {
-	const deadline = Date.now() + 15 * 60 * 1000; // ponytail: 15min cap, no earlier bail
+async function waitForBrowserClosed(port: string, child: ChildProcess): Promise<boolean> {
+	const deadline = Date.now() + 15 * 60 * 1000;
 	while (Date.now() < deadline) {
-		if (child.exitCode !== null) return;
+		if (hasExited(child)) return true;
 		try {
-			const res = await fetch(`http://127.0.0.1:${port}/json/list`);
-			const targets: { type: string }[] = await res.json();
-			if (!targets.some(t => t.type === 'page')) return;
+			const targets: { type: string }[] = await fetchDevToolsJson(port, '/json/list');
+			if (!targets.some(t => t.type === 'page')) return false;
 		} catch {
-			return; // DevTools endpoint gone -> browser exited
+			return true; // Endpoint gone; clean up this process before restarting.
 		}
 		await sleep(250);
 	}
+	return hasExited(child);
 }
 
-async function waitForDevToolsPort(portFile: string, timeoutMs: number): Promise<string> {
+async function waitForDevToolsPort(portFile: string, timeoutMs: number, child: ChildProcess, startupError: () => Error | undefined): Promise<string> {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
+		const error = startupError();
+		if (error) throw error;
+		if (hasExited(child)) throw new Error('Browser exited before exposing a DevTools port');
 		try {
 			const content = fs.readFileSync(portFile, 'utf-8').trim();
 			const port = content.split('\n')[0];
@@ -141,32 +206,48 @@ async function waitForDevToolsPort(portFile: string, timeoutMs: number): Promise
 	throw new Error('Browser did not expose a DevTools port in time');
 }
 
+async function stopBrowser(port: string | undefined, child: ChildProcess): Promise<void> {
+	if (hasExited(child)) return;
+	let browser: CdpConnection | undefined;
+	try {
+		if (!port) throw new Error('No DevTools port');
+		const version = await fetchDevToolsJson(port, '/json/version');
+		browser = await CdpConnection.connect(version.webSocketDebuggerUrl);
+		await browser.send('Browser.close', {}, 5000);
+	} catch {
+		if (!hasExited(child)) child.kill();
+	} finally {
+		browser?.close();
+	}
+
+	// Wait for profile flushing before a subsequent launch uses the same profile.
+	if (hasExited(child)) return;
+	await new Promise<void>((resolve, reject) => {
+		const onExit = () => { clearTimeout(timer); resolve(); };
+		const timer = setTimeout(() => {
+			child.off('exit', onExit);
+			child.kill();
+			reject(new Error('Browser did not exit after shutdown'));
+		}, 10000);
+		child.once('exit', onExit);
+	});
+}
+
 /**
  * Fetch a page's HTML with a real browser. Returns the rendered outerHTML
  * (prefixed with <!DOCTYPE html>) including any logged-in content.
  */
 export async function fetchViaBrowser(url: string, options: BrowserFetchOptions = {}): Promise<string> {
-	if (options.interactive) {
-		// Interactive login flow: open the page, let the user log in and close
-		// the window themselves, then re-fetch with the persisted session.
-		const browserExe = findBrowser(options.browserPath);
-		const profileDir = path.join(os.homedir(), '.obsidian-clipper', 'profile');
-		fs.mkdirSync(profileDir, { recursive: true });
-		const child = spawn(browserExe, [
-			'--remote-debugging-port=0',
-			`--user-data-dir=${profileDir}`,
-			'--no-first-run',
-			'--no-default-browser-check',
-			url,
-		], { stdio: 'ignore' });
-		const portFile = path.join(profileDir, 'DevToolsActivePort');
-		const port = await waitForDevToolsPort(portFile, 15000);
-		console.error(`Browser opened at ${url}.`);
-		console.error(`Log in if needed, then CLOSE the browser window — the CLI will re-fetch with the saved session.`);
-		await waitForBrowserClosed(port, child);
-		return fetchViaBrowser(url, { browserPath: options.browserPath });
-	}
+	const html = await fetchBrowserSession(url, options);
+	// Windows/Linux may exit the browser on window close; macOS stays in the
+	// same session and captures through its existing DevTools endpoint.
+	if (html !== undefined) return html;
+	const retriedHtml = await fetchBrowserSession(url, { ...options, interactive: false });
+	if (retriedHtml === undefined) throw new Error('Failed to capture page HTML after login');
+	return retriedHtml;
+}
 
+async function fetchBrowserSession(url: string, options: BrowserFetchOptions): Promise<string | undefined> {
 	const browserExe = findBrowser(options.browserPath);
 	const profileDir = path.join(os.homedir(), '.obsidian-clipper', 'profile');
 	fs.mkdirSync(profileDir, { recursive: true });
@@ -178,25 +259,29 @@ export async function fetchViaBrowser(url: string, options: BrowserFetchOptions 
 		`--user-data-dir=${profileDir}`,
 		'--no-first-run',
 		'--no-default-browser-check',
-		'about:blank',
+		options.interactive ? url : 'about:blank',
 	], { stdio: 'ignore' });
+	let startupError: Error | undefined;
+	child.on('error', (error: Error) => { startupError = error; });
 
 	let port: string | undefined;
 	try {
-		port = await waitForDevToolsPort(portFile, 15000);
+		port = await waitForDevToolsPort(portFile, 15000, child, () => startupError);
+		if (options.interactive) {
+			console.error(`Browser opened at ${url}.`);
+			console.error('Log in if needed, then CLOSE the browser window — the CLI will re-fetch with the saved session.');
+			if (await waitForBrowserClosed(port, child)) return undefined;
+		}
 
 		// Open a fresh tab for the target URL and connect to its CDP endpoint.
 		// PUT is required by newer Chrome versions.
-		const newTargetRes = await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: 'PUT' });
-		const target = await newTargetRes.json();
+		const target = await fetchDevToolsJson(port, '/json/new?about:blank', 'PUT');
 		const page = await CdpConnection.connect(target.webSocketDebuggerUrl);
 
 		try {
 			await page.send('Page.enable');
-			const loaded = page.waitForEvent('Page.loadEventFired');
-			await page.send('Page.navigate', { url });
-			// ponytail: fixed 30s nav timeout; no retry. Hangs kill the agent's run visibly.
-			await Promise.race([loaded, sleep(30000)]);
+			const loaded = page.waitForEvent('Page.loadEventFired', 30000);
+			await Promise.all([page.send('Page.navigate', { url }), loaded]);
 			// Wait for JS-rendered content to stabilize (replaces a fixed delay —
 			// SPA pages that redirect after login need more than 1s).
 			await waitForStableContent(page);
@@ -214,16 +299,6 @@ export async function fetchViaBrowser(url: string, options: BrowserFetchOptions 
 			page.close();
 		}
 	} finally {
-		// Graceful shutdown via CDP so the profile is flushed cleanly.
-		try {
-			if (!port) throw new Error('no port');
-			const versionRes = await fetch(`http://127.0.0.1:${port}/json/version`);
-			const version = await versionRes.json();
-			const browserWs = await CdpConnection.connect(version.webSocketDebuggerUrl);
-			await browserWs.send('Browser.close');
-			browserWs.close();
-		} catch {
-			child.kill();
-		}
+		await stopBrowser(port, child);
 	}
 }

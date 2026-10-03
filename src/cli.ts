@@ -199,7 +199,7 @@ function resolveOutputPath(outputPath: string, noteName: string, url: string): s
 	if (fs.existsSync(resolved)) {
 		isDir = fs.statSync(resolved).isDirectory();
 	} else {
-		isDir = !path.extname(resolved) || resolved.endsWith(path.sep) || resolved.endsWith('/');
+		isDir = !path.extname(resolved) || outputPath.endsWith(path.sep) || outputPath.endsWith('/');
 	}
 
 	if (!isDir) return resolved;

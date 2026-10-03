@@ -78,14 +78,21 @@ CLI 启动浏览器打开目标页
 CLI 检测到所有 page target 消失
    │
    ▼
-自动重开浏览器 → 带登录态重新抓取 → 输出
+进程仍在：复用浏览器；进程已退出：重新启动
+   │
+   ▼
+带登录态重新抓取 → 输出
 ```
 
 > 为什么等 page target 而不是进程退出：macOS 上关闭窗口不退出 Chrome（常驻 Dock），等进程会永久挂住。轮询 CDP `/json/list` 在 Windows / macOS 行为一致。
 
+复用仍在运行的浏览器时保留原有 CDP 端口；需要重新启动时先等待旧进程退出，避免 profile 尚未写完就被下一次启动使用。
+
 ### §4.3 渲染等待
 
 页面 load 后，CLI 每 400ms 轮询 `document.body.innerText.length`，**连续两次不变即认为内容稳定**再抓取（封顶 10s）。这是为登录后重定向 + 客户端渲染的 SPA 设计的——固定 1 秒静默期会抓到空壳。
+
+CDP 断连或命令超时会报错退出；正文稳定检测中的命令超时受剩余 10s 预算约束。页面加载成功后立即清除导航超时计时器，CLI 不再额外等待 30s 才退出。
 
 ## §5 输出规则
 
@@ -112,7 +119,7 @@ CLI 检测到所有 page target 消失
 
 ## §7 限制与风险（如实）
 
-1. ⚠️ macOS 交互流程（关窗检测）逻辑上跨平台，但**无 Mac 环境实测**；挂住则 Ctrl+C 后重试
+1. ⚠️ macOS 交互流程已通过模拟「关窗后进程仍存活」的回归测试，但**尚未做真实浏览器登录实测**
 2. ⚠️ macOS 的 Edge 检测路径未列入候选表（`/Applications/Microsoft Edge.app/...`）；Mac 上需用 Chrome 或 `--browser-path`
 3. 仓库遗留：`src/utils/template-integration.test.ts` 的 `youtube` fixture 在本次改动前即失败，与 CLI 无关
 4. `--interactive` 等待关窗有 15 分钟上限，超时直接继续抓取（可能仍是未登录内容）
