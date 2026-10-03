@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { spawn } from 'child_process';
-import { fetchViaBrowser } from './browser-fetch';
+import { fetchViaBrowser, withBrowserPage } from './browser-fetch';
 
 const state = vi.hoisted(() => ({
 	portFile: false,
@@ -52,8 +52,11 @@ vi.mock('ws', async () => {
 					if (state.pageCommand === 'error') this.emit('error', new Error('socket failed'));
 					return;
 				}
-				const result = method === 'Runtime.evaluate'
-					? { result: { value: params.expression.includes('outerHTML') ? '<html><body>Article</body></html>' : 7 } }
+				const result = method === 'Page.getFrameTree' ? { frameTree: { frame: { id: 'frame' } } }
+					: method === 'Network.loadNetworkResource' ? { resource: { success: true, httpStatusCode: 200, stream: 'image' } }
+					: method === 'IO.read' ? { data: 'aW1hZ2U=', base64Encoded: true, eof: true }
+					: method === 'Runtime.evaluate'
+					? { result: { value: params.expression.includes('currentSrc') ? { html: '<html><body>Article</body></html>', url: 'https://example.com/final', baseUrl: 'https://cdn.example.com/' } : params.expression.includes('outerHTML') ? '<html><body>Article</body></html>' : 7 } }
 					: {};
 				this.emit('message', Buffer.from(JSON.stringify({ id, result })));
 				if (method === 'Page.navigate') this.emit('message', Buffer.from(JSON.stringify({ method: 'Page.loadEventFired' })));
@@ -193,4 +196,23 @@ describe('fetchViaBrowser', () => {
 		expect(state.children[0].kill).toHaveBeenCalledOnce();
 		expect(vi.getTimerCount()).toBe(0);
 	});
+});
+
+
+test('keeps the authenticated page live through image processing and shuts down on callback failure', async () => {
+	let downloaded = '';
+	const result = withBrowserPage('https://example.com', { browserPath: '/browser', interactive: true }, async page => {
+		expect(state.children[0].exitCode).toBeNull();
+		expect(page.url).toBe('https://example.com/final');
+		expect(page.baseUrl).toBe('https://cdn.example.com/');
+		for await (const chunk of await page.fetchImage('https://example.com/image.png', new AbortController().signal)) downloaded += Buffer.from(chunk).toString();
+		throw new Error('output failed');
+	});
+	const assertion = expect(result).rejects.toThrow('output failed');
+	await vi.runAllTimersAsync();
+	await assertion;
+	expect(downloaded).toBe('image');
+	expect(spawn).toHaveBeenCalledTimes(1);
+	expect(state.children[0].exitCode).toBe(0);
+	expect(vi.getTimerCount()).toBe(0);
 });

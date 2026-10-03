@@ -29,6 +29,8 @@ export interface ClipOptions {
 	template: Template;
 	documentParser: DocumentParser;
 	propertyTypes?: Record<string, string>;
+	/** Base for content resources, independent of the source URL in properties. */
+	resourceBaseUrl?: string;
 	/** Pre-parsed document to skip re-parsing (e.g. when already parsed for trigger matching). */
 	parsedDocument?: any;
 }
@@ -185,11 +187,12 @@ export async function clip(options: ClipOptions): Promise<ClipResult> {
 
 	// Extract content with defuddle
 	// Cast through unknown: linkedom's Document is structurally compatible but not nominally typed as DOM Document
-	const defuddle = new DefuddleClass(doc as unknown as Document, { url });
+	const resourceBaseUrl = options.resourceBaseUrl ?? url;
+	const defuddle = new DefuddleClass(doc as unknown as Document, { url: resourceBaseUrl });
 	const defuddleResult = defuddle.parse();
 
 	// Convert to markdown
-	const markdownContent = createMarkdownContent(defuddleResult.content, url);
+	const markdownContent = createMarkdownContent(defuddleResult.content, resourceBaseUrl);
 
 	// Build template variables
 	const variables = buildVariables({

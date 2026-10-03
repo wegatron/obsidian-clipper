@@ -3,7 +3,8 @@
 import { parseHTML } from 'linkedom';
 import { clip, matchTemplate, DocumentParser } from './api';
 import { openInObsidian } from './utils/cli-utils';
-import { fetchViaBrowser } from './utils/browser-fetch';
+import { fetchViaBrowser, withBrowserPage } from './utils/browser-fetch';
+import { localizeImages, type ImageFetcher } from './utils/image-localizer';
 import { sanitizeFileName } from './utils/string-utils';
 import { Template } from './types/types';
 import * as fs from 'fs';
@@ -26,6 +27,8 @@ interface CliArgs {
 	browser: boolean;
 	interactive: boolean;
 	browserPath?: string;
+	imagesDir?: string;
+	imagesStrict: boolean;
 }
 
 // Default template used when --template is omitted (AI-agent mode).
@@ -62,6 +65,8 @@ Options:
       --interactive            Like --browser, but the browser stays open until you
                                close it — use to log in to a site the first time
       --browser-path <path>    Custom browser executable (default: Chrome, then Edge)
+      --images-dir <dir>       Download content images into this directory (requires -o)
+      --images-strict          Fail without writing the note if any image fails
       --vault <name>           Obsidian vault name
       --open                   Send to Obsidian instead of writing file
       --uri                    Use URI scheme instead of Obsidian CLI
@@ -86,6 +91,8 @@ function parseArgs(argv: string[]): CliArgs {
 	let browser = false;
 	let interactive = false;
 	let browserPath: string | undefined;
+	let imagesDir: string | undefined;
+	let imagesStrict = false;
 
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i];
@@ -104,6 +111,13 @@ function parseArgs(argv: string[]): CliArgs {
 			case '--output':
 				if (i + 1 >= args.length) { console.error('Error: --output requires a value'); process.exit(1); }
 				outputPath = args[++i];
+				break;
+			case '--images-dir':
+				if (!args[i + 1] || args[i + 1].startsWith('-')) throw new Error('--images-dir requires a value');
+				imagesDir = args[++i];
+				break;
+			case '--images-strict':
+				imagesStrict = true;
 				break;
 			case '--vault':
 				if (i + 1 >= args.length) { console.error('Error: --vault requires a value'); process.exit(1); }
@@ -154,7 +168,11 @@ function parseArgs(argv: string[]): CliArgs {
 		process.exit(1);
 	}
 
-	return { url, templatePath, outputPath, vault, open, silent, uri, propertyTypesPath, htmlPath, browser, interactive, browserPath };
+	if (imagesDir && !outputPath) throw new Error('--images-dir requires -o / --output');
+	if (imagesDir && open) throw new Error('--images-dir cannot be combined with --open');
+	if (imagesStrict && !imagesDir) throw new Error('--images-strict requires --images-dir');
+
+	return { imagesDir, imagesStrict, url, templatePath, outputPath, vault, open, silent, uri, propertyTypesPath, htmlPath, browser, interactive, browserPath };
 }
 
 // ---------------------------------------------------------------------------
@@ -247,95 +265,116 @@ async function main(): Promise<void> {
 		propertyTypes = JSON.parse(raw);
 	}
 
-	// Get HTML: from file/stdin (--html), via real browser (--browser), or by fetching URL
-	let html: string;
-	if (args.htmlPath) {
-		if (args.htmlPath === '-') {
-			html = fs.readFileSync(0, 'utf-8'); // stdin
-		} else {
-			html = fs.readFileSync(path.resolve(args.htmlPath), 'utf-8');
-		}
-	} else if (args.browser) {
-		html = await fetchViaBrowser(args.url, {
-			interactive: args.interactive,
-			browserPath: args.browserPath,
-		});
-		// ponytail: debug-only env dump for diagnosing bad captures
-		if (process.env.CLIPPER_DEBUG_HTML) {
-			fs.writeFileSync(process.env.CLIPPER_DEBUG_HTML, html, 'utf-8');
-		}
-	} else {
-		const response = await fetch(args.url);
-		if (!response.ok) {
-			console.error(`Failed to fetch ${args.url}: ${response.status} ${response.statusText}`);
-			process.exit(1);
-		}
-		html = await response.text();
+	const cancellation = new AbortController();
+	const cancel = () => cancellation.abort(new Error('Clipping cancelled'));
+	if (args.imagesDir) {
+		process.once('SIGINT', cancel);
+		process.once('SIGTERM', cancel);
 	}
+	const output = async (page: { html: string; url: string; baseUrl?: string; fetchImage?: ImageFetcher }) => {
+		const { html, url: pageUrl, baseUrl: browserBaseUrl, fetchImage: imageFetcher } = page;
+		const resourceDocument = args.imagesDir ? linkedomParser.parseFromString(html, 'text/html') : undefined;
+		const baseHref = resourceDocument?.querySelector('base[href]')?.getAttribute('href');
+		let resourceBaseUrl = browserBaseUrl ?? pageUrl;
+		if (!browserBaseUrl && baseHref) {
+			try { resourceBaseUrl = new URL(baseHref, pageUrl).href; } catch { /* Invalid base falls back to the page URL. */ }
+		}
+		// If using a template directory, match template by triggers.
+		// Try URL triggers first (no parsing needed). Only parse for schema if required.
+		let parsedDocument: any = resourceDocument;
+		if (templates) {
+			// First try URL-only matching (no HTML parsing needed)
+			let matched = matchTemplate(templates, args.url);
 
-	// If using a template directory, match template by triggers.
-	// Try URL triggers first (no parsing needed). Only parse for schema if required.
-	let parsedDocument: any;
-	if (templates) {
-		// First try URL-only matching (no HTML parsing needed)
-		let matched = matchTemplate(templates, args.url);
-
-		// If no URL match, check if any templates have schema triggers
-		if (!matched) {
-			const hasSchemaTrigs = templates.some(t => t.triggers?.some(tr => tr.startsWith('schema:')));
-			if (hasSchemaTrigs) {
-				const DefuddleClass = (await import('defuddle')).default;
-				parsedDocument = linkedomParser.parseFromString(html, 'text/html');
-				const defuddle = new DefuddleClass(parsedDocument as unknown as Document, { url: args.url });
-				const defuddleResult = defuddle.parse();
-				matched = matchTemplate(templates, args.url, defuddleResult.schemaOrgData);
+			// If no URL match, check if any templates have schema triggers
+			if (!matched) {
+				const hasSchemaTrigs = templates.some(t => t.triggers?.some(tr => tr.startsWith('schema:')));
+				if (hasSchemaTrigs) {
+					const DefuddleClass = (await import('defuddle')).default;
+					parsedDocument ??= linkedomParser.parseFromString(html, 'text/html');
+					const defuddle = new DefuddleClass(parsedDocument as unknown as Document, { url: args.imagesDir ? resourceBaseUrl : args.url });
+					const defuddleResult = defuddle.parse();
+					matched = matchTemplate(templates, args.url, defuddleResult.schemaOrgData);
+				}
 			}
+
+			if (!matched) {
+				throw new Error(`No template matched URL ${args.url}; searched ${templates.length} templates in ${args.templatePath}`);
+			}
+			template = matched;
+			console.error(`Matched template: ${templateFilePaths.get(template) || 'unknown'}`);
 		}
 
-		if (!matched) {
-			console.error(`Error: No template matched URL ${args.url}`);
-			console.error(`Searched ${templates.length} templates in ${args.templatePath}`);
-			process.exit(1);
+		if (!template) {
+			throw new Error('No template resolved');
 		}
-		template = matched;
-		console.error(`Matched template: ${templateFilePaths.get(template) || 'unknown'}`);
-	}
 
-	if (!template) {
-		console.error('Error: No template resolved');
-		process.exit(1);
-	}
+		// Call the API (reuse pre-parsed document if available)
+		const result = await clip({
+			html,
+			url: args.url,
+			template,
+			documentParser: linkedomParser,
+			propertyTypes,
+			parsedDocument,
+			resourceBaseUrl: args.imagesDir ? resourceBaseUrl : undefined,
+		});
 
-	// Call the API (reuse pre-parsed document if available)
-	const result = await clip({
-		html,
-		url: args.url,
-		template,
-		documentParser: linkedomParser,
-		propertyTypes,
-		parsedDocument,
-	});
-
-	// Output
-	if (args.open) {
-		const vault = args.vault || template.vault || '';
-		const obsResult = await openInObsidian(
-			result.fullContent,
-			result.noteName,
-			template.path || '',
-			vault,
-			template.behavior || 'create',
-			args.silent,
-			args.uri
-		);
-		console.error(obsResult);
-	} else if (args.outputPath) {
-		const filePath = resolveOutputPath(args.outputPath, result.noteName, args.url);
-		fs.writeFileSync(filePath, result.fullContent, 'utf-8');
-		// Full path on stdout so calling agents can pick it up.
-		console.log(filePath);
-	} else {
-		process.stdout.write(result.fullContent);
+		// Output
+		if (args.open) {
+			const vault = args.vault || template.vault || '';
+			const obsResult = await openInObsidian(
+				result.fullContent,
+				result.noteName,
+				template.path || '',
+				vault,
+				template.behavior || 'create',
+				args.silent,
+				args.uri
+			);
+			console.error(obsResult);
+		} else if (args.outputPath) {
+			const filePath = resolveOutputPath(args.outputPath, result.noteName, args.url);
+			let content = result.fullContent;
+			if (args.imagesDir) {
+				const localized = await localizeImages({
+					markdown: result.content, pageBaseUrl: resourceBaseUrl, noteFilePath: filePath,
+					imagesDir: path.resolve(args.imagesDir), imageFetcher, signal: cancellation.signal,
+				});
+				console.error(`Images: ${localized.saved} saved, ${localized.reused} reused, ${localized.failures.length} failed, ${localized.skipped} skipped`);
+				for (const failure of localized.failures) console.error(`Image failed: ${failure.url}: ${failure.error}`);
+				if (args.imagesStrict && localized.failures.length) throw new Error('Image download failed in strict mode; note was not written');
+				content = result.frontmatter + localized.markdown;
+				cancellation.signal.throwIfAborted();
+			}
+			fs.writeFileSync(filePath, content, 'utf-8');
+			// Full path on stdout so calling agents can pick it up.
+			console.log(filePath);
+		} else {
+			process.stdout.write(result.fullContent);
+		}
+	};
+	try {
+		if (args.htmlPath) {
+			await output({ html: fs.readFileSync(args.htmlPath === '-' ? 0 : path.resolve(args.htmlPath), 'utf-8'), url: args.url });
+		} else if (args.browser && args.imagesDir) {
+			await withBrowserPage(args.url, { interactive: args.interactive, browserPath: args.browserPath, signal: cancellation.signal },
+				page => {
+					if (process.env.CLIPPER_DEBUG_HTML) fs.writeFileSync(process.env.CLIPPER_DEBUG_HTML, page.html, 'utf-8');
+					return output(page);
+				});
+		} else if (args.browser) {
+			const html = await fetchViaBrowser(args.url, { interactive: args.interactive, browserPath: args.browserPath });
+			if (process.env.CLIPPER_DEBUG_HTML) fs.writeFileSync(process.env.CLIPPER_DEBUG_HTML, html, 'utf-8');
+			await output({ html, url: args.url });
+		} else {
+			const response = await fetch(args.url, { signal: cancellation.signal });
+			if (!response.ok) throw new Error(`Failed to fetch ${args.url}: ${response.status} ${response.statusText}`);
+			await output({ html: await response.text(), url: response.url });
+		}
+	} finally {
+		process.removeListener('SIGINT', cancel);
+		process.removeListener('SIGTERM', cancel);
 	}
 }
 

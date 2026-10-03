@@ -8,12 +8,14 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import WebSocket from 'ws';
+import type { ImageFetcher } from './image-localizer';
 
 export interface BrowserFetchOptions {
 	/** Wait for the user to close the browser window after logging in. */
 	interactive?: boolean;
 	/** Custom browser executable path. */
 	browserPath?: string;
+	signal?: AbortSignal;
 }
 
 function findBrowser(customPath?: string): string {
@@ -25,6 +27,7 @@ function findBrowser(customPath?: string): string {
 		'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
 		'C:/Program Files/Microsoft/Edge/Application/msedge.exe',
 		'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+		'/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
 		'/usr/bin/google-chrome',
 		'/usr/bin/chromium',
 		'/usr/bin/microsoft-edge',
@@ -111,13 +114,16 @@ class CdpConnection {
 		}
 	}
 
-	send(method: string, params: Record<string, unknown> = {}, timeoutMs = 10000): Promise<any> {
+	send(method: string, params: Record<string, unknown> = {}, timeoutMs = 10000, signal?: AbortSignal): Promise<any> {
 		if (this.closedError) return Promise.reject(this.closedError);
+		if (signal?.aborted) return Promise.reject(signal.reason);
 		const id = this.nextId++;
 		return new Promise((resolve, reject) => {
-			const cleanup = () => { clearTimeout(timer); this.pending.delete(id); };
+			const cleanup = () => { clearTimeout(timer); this.pending.delete(id); signal?.removeEventListener('abort', onAbort); };
 			const fail = (error: Error) => { cleanup(); reject(error); };
+			const onAbort = () => fail(signal!.reason);
 			const timer = setTimeout(() => fail(new Error(`CDP command ${method} timed out`)), timeoutMs);
+			signal?.addEventListener('abort', onAbort, { once: true });
 			this.pending.set(id, {
 				resolve: value => { cleanup(); resolve(value); },
 				reject: fail,
@@ -233,21 +239,80 @@ async function stopBrowser(port: string | undefined, child: ChildProcess): Promi
 	});
 }
 
+export interface BrowserPage {
+	html: string;
+	url: string;
+	baseUrl: string;
+	/** Valid only while the withBrowserPage callback is running. */
+	fetchImage: ImageFetcher;
+}
+
 /**
  * Fetch a page's HTML with a real browser. Returns the rendered outerHTML
  * (prefixed with <!DOCTYPE html>) including any logged-in content.
  */
 export async function fetchViaBrowser(url: string, options: BrowserFetchOptions = {}): Promise<string> {
-	const html = await fetchBrowserSession(url, options);
-	// Windows/Linux may exit the browser on window close; macOS stays in the
-	// same session and captures through its existing DevTools endpoint.
-	if (html !== undefined) return html;
-	const retriedHtml = await fetchBrowserSession(url, { ...options, interactive: false });
-	if (retriedHtml === undefined) throw new Error('Failed to capture page HTML after login');
-	return retriedHtml;
+	return runBrowserSession(url, options, page => Promise.resolve(page.html), false);
 }
 
-async function fetchBrowserSession(url: string, options: BrowserFetchOptions): Promise<string | undefined> {
+/** Keep the authenticated browser alive until capture and image processing finish. */
+export async function withBrowserPage<T>(url: string, options: BrowserFetchOptions, processPage: (page: BrowserPage) => Promise<T>): Promise<T> {
+	return runBrowserSession(url, options, processPage, true);
+}
+
+async function runBrowserSession<T>(url: string, options: BrowserFetchOptions, processPage: (page: BrowserPage) => Promise<T>, captureImages: boolean): Promise<T> {
+	const result = await fetchBrowserSession(url, options, processPage, captureImages);
+	if (result) return result.value;
+	const retried = await fetchBrowserSession(url, { ...options, interactive: false }, processPage, captureImages);
+	if (!retried) throw new Error('Failed to capture page HTML after login');
+	return retried.value;
+}
+
+function browserImageFetcher(page: CdpConnection, frameId: string): ImageFetcher {
+	return async (url, signal) => (async function* () {
+		// Network service uses this live page's cookies and authentication state.
+		// Keep the load promise so a late stream can still be closed after abort.
+		const loading = page.send('Network.loadNetworkResource', {
+			frameId, url, options: { disableCache: false, includeCredentials: true },
+		}, 30000);
+		let aborted = false;
+		const cancel = () => { aborted = true; };
+		signal.addEventListener('abort', cancel, { once: true });
+		if (signal.aborted) cancel();
+		loading.then(result => {
+			if (aborted && result?.resource?.stream) void page.send('IO.close', { handle: result.resource.stream }).catch(() => {});
+		}, () => {});
+		let handle: string | undefined;
+		try {
+			const loaded = await abortable(loading, signal);
+			const resource = loaded?.resource;
+			handle = resource?.stream;
+			if (!resource?.success || resource.httpStatusCode < 200 || resource.httpStatusCode >= 300 || !handle) {
+				throw new Error(`Browser image request failed: HTTP ${resource?.httpStatusCode ?? 'unknown'} (${resource?.netErrorName ?? 'no stream'})`);
+			}
+			while (true) {
+				const chunk = await page.send('IO.read', { handle, size: 64 * 1024 }, 30000, signal);
+				yield Buffer.from(chunk.data ?? '', chunk.base64Encoded ? 'base64' : 'utf8');
+				if (chunk.eof) return;
+			}
+		} finally {
+			signal.removeEventListener('abort', cancel);
+			if (handle) await page.send('IO.close', { handle }).catch(() => {});
+		}
+	})();
+}
+
+function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+	if (signal.aborted) return Promise.reject(signal.reason);
+	return new Promise((resolve, reject) => {
+		const abort = () => { signal.removeEventListener('abort', abort); reject(signal.reason); };
+		signal.addEventListener('abort', abort, { once: true });
+		operation.then(value => { signal.removeEventListener('abort', abort); resolve(value); }, error => { signal.removeEventListener('abort', abort); reject(error); });
+	});
+}
+
+async function fetchBrowserSession<T>(url: string, options: BrowserFetchOptions, processPage: (page: BrowserPage) => Promise<T>, captureImages: boolean): Promise<{ value: T } | undefined> {
+	options.signal?.throwIfAborted();
 	const browserExe = findBrowser(options.browserPath);
 	const profileDir = path.join(os.homedir(), '.obsidian-clipper', 'profile');
 	fs.mkdirSync(profileDir, { recursive: true });
@@ -265,6 +330,10 @@ async function fetchBrowserSession(url: string, options: BrowserFetchOptions): P
 	child.on('error', (error: Error) => { startupError = error; });
 
 	let port: string | undefined;
+	let pageConnection: CdpConnection | undefined;
+	const cancel = () => { pageConnection?.close(); if (!hasExited(child)) child.kill(); };
+	options.signal?.addEventListener('abort', cancel, { once: true });
+	if (options.signal?.aborted) cancel();
 	try {
 		port = await waitForDevToolsPort(portFile, 15000, child, () => startupError);
 		if (options.interactive) {
@@ -277,6 +346,8 @@ async function fetchBrowserSession(url: string, options: BrowserFetchOptions): P
 		// PUT is required by newer Chrome versions.
 		const target = await fetchDevToolsJson(port, '/json/new?about:blank', 'PUT');
 		const page = await CdpConnection.connect(target.webSocketDebuggerUrl);
+		pageConnection = page;
+		options.signal?.throwIfAborted();
 
 		try {
 			await page.send('Page.enable');
@@ -287,18 +358,38 @@ async function fetchBrowserSession(url: string, options: BrowserFetchOptions): P
 			await waitForStableContent(page);
 
 			const evalRes = await page.send('Runtime.evaluate', {
-				expression: 'document.documentElement.outerHTML',
+				expression: captureImages ? `(() => {
+					const snapshot = document.documentElement.cloneNode(true);
+					const images = document.querySelectorAll('img');
+					snapshot.querySelectorAll('img').forEach((image, index) => {
+						if (images[index].currentSrc) {
+							image.setAttribute('src', images[index].currentSrc);
+							['srcset', 'sizes', 'data-src', 'data-srcset', 'data-original', 'data-lazy-src'].forEach(name => image.removeAttribute(name));
+						}
+					});
+					// Prevent picture sources from selecting a different image during extraction.
+					snapshot.querySelectorAll('picture source').forEach(source => source.remove());
+					return { html: snapshot.outerHTML, url: location.href, baseUrl: document.baseURI };
+				})()` : 'document.documentElement.outerHTML',
 				returnByValue: true,
 			});
-			const html = evalRes?.result?.value;
+			const snapshot = evalRes?.result?.value;
+			const html = captureImages ? snapshot?.html : snapshot;
 			if (typeof html !== 'string' || html.length === 0) {
 				throw new Error('Failed to capture page HTML from browser');
 			}
-			return `<!DOCTYPE html>\n${html}`;
+			const frames = captureImages ? await page.send('Page.getFrameTree') : undefined;
+			options.signal?.throwIfAborted();
+			return { value: await processPage({
+				html: `<!DOCTYPE html>\n${html}`, url: captureImages ? snapshot.url : url,
+				baseUrl: captureImages ? snapshot.baseUrl : url,
+				fetchImage: browserImageFetcher(page, frames?.frameTree?.frame?.id),
+			}) };
 		} finally {
 			page.close();
 		}
 	} finally {
+		options.signal?.removeEventListener('abort', cancel);
 		await stopBrowser(port, child);
 	}
 }
